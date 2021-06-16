@@ -6,13 +6,13 @@ hide_title: true
 # Meshes and IO
 
 The Meshes object represents a batch of triangulated meshes, and is central to
-much of the functionality of pytorch3d. There is no insistence that each mesh in
+much of the functionality of PyTorch3D. There is no insistence that each mesh in
 the batch has the same number of vertices or faces. When available, it can store
 other data which pertains to the mesh, for example face normals, face areas
 and textures.
 
 Two common file formats for storing single meshes are ".obj" and ".ply" files,
-and pytorch3d has functions for reading these.
+and PyTorch3D has functions for reading these.
 
 ## OBJ
 
@@ -55,9 +55,12 @@ tex = Textures(verts_uvs=verts_uvs, faces_uvs=faces_uvs, maps=texture_image)
 # Initialise the mesh with textures
 meshes = Meshes(verts=[verts], faces=[faces.verts_idx], textures=tex)
 ```
+
+The `load_objs_as_meshes` function provides this procedure.
+
 ## PLY
 
-Ply files are flexible in the way they store additional information, pytorch3d
+Ply files are flexible in the way they store additional information. PyTorch3D
 provides a function just to read the vertices and faces from a ply file.
 The call
 ```

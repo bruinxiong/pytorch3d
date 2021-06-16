@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 from itertools import product
+
 import torch
 from fvcore.common.benchmark import benchmark
-
 from test_mesh_laplacian_smoothing import TestLaplacianSmoothing
 
 
@@ -31,3 +30,7 @@ def bm_mesh_laplacian_smoothing() -> None:
         kwargs_list,
         warmup_iters=1,
     )
+
+
+if __name__ == "__main__":
+    bm_mesh_laplacian_smoothing()

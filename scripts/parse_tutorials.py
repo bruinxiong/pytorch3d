@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 import argparse
 import json
@@ -38,7 +38,7 @@ JS_SCRIPTS = """
 
 
 def gen_tutorials(repo_dir: str) -> None:
-    """Generate HTML tutorials for PyTorch3d Docusaurus site from Jupyter notebooks.
+    """Generate HTML tutorials for PyTorch3D Docusaurus site from Jupyter notebooks.
 
     Also create ipynb and py versions of tutorial in Docusaurus site for
     download.
@@ -52,7 +52,9 @@ def gen_tutorials(repo_dir: str) -> None:
         print("Generating {} tutorial".format(tid))
 
         # convert notebook to HTML
-        ipynb_in_path = os.path.join(repo_dir, "docs", "tutorials", "{}.ipynb".format(tid))
+        ipynb_in_path = os.path.join(
+            repo_dir, "docs", "tutorials", "{}.ipynb".format(tid)
+        )
         with open(ipynb_in_path, "r") as infile:
             nb_str = infile.read()
             nb = nbformat.reads(nb_str, nbformat.NO_CONVERT)
@@ -105,7 +107,7 @@ if __name__ == "__main__":
         description="Generate JS, HTML, ipynb, and py files for tutorials."
     )
     parser.add_argument(
-        "--repo_dir", metavar="path", required=True, help="Pytorch3D repo directory."
+        "--repo_dir", metavar="path", required=True, help="PyTorch3D repo directory."
     )
     args = parser.parse_args()
     gen_tutorials(args.repo_dir)

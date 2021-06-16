@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import torch
 
+from ..common.types import Device
 from .utils import TensorProperties
 
 
@@ -19,7 +19,7 @@ class Materials(TensorProperties):
         diffuse_color=((1, 1, 1),),
         specular_color=((1, 1, 1),),
         shininess=64,
-        device="cpu",
+        device: Device = "cpu",
     ):
         """
         Args:
@@ -30,7 +30,7 @@ class Materials(TensorProperties):
                 the focus of the specular highlight with a high value
                 resulting in a concentrated highlight. Shininess values
                 can range from 0-1000.
-            device: torch.device or string
+            device: Device (as str or torch.device) on which the tensors should be located
 
         ambient_color, diffuse_color and specular_color can be of shape
         (1, 3) or (N, 3). shininess can be of shape (1) or (N).

@@ -1,17 +1,17 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import unittest
-import torch
 
+import torch
+from common_testing import TestCaseMixin
 from pytorch3d.ops.subdivide_meshes import SubdivideMeshes
 from pytorch3d.structures.meshes import Meshes
 from pytorch3d.utils.ico_sphere import ico_sphere
 
 
-class TestSubdivideMeshes(unittest.TestCase):
-    def test_simple_subdivide(self):
+class TestSubdivideMeshes(TestCaseMixin, unittest.TestCase):
+    def simple_subdivide(self, with_init=False):
         # Create a mesh with one face and check the subdivided mesh has
         # 4 faces with the correct vertex coordinates.
         device = torch.device("cuda:0")
@@ -23,7 +23,8 @@ class TestSubdivideMeshes(unittest.TestCase):
         )
         faces = torch.tensor([[0, 1, 2]], dtype=torch.int64, device=device)
         mesh = Meshes(verts=[verts], faces=[faces])
-        subdivide = SubdivideMeshes()
+        mesh_init = mesh.clone() if with_init else None
+        subdivide = SubdivideMeshes(meshes=mesh_init)
         new_mesh = subdivide(mesh)
 
         # Subdivided face:
@@ -57,9 +58,15 @@ class TestSubdivideMeshes(unittest.TestCase):
             device=device,
         )
         new_verts, new_faces = new_mesh.get_mesh_verts_faces(0)
-        self.assertTrue(torch.allclose(new_verts, gt_subdivide_verts))
-        self.assertTrue(torch.allclose(new_faces, gt_subdivide_faces))
+        self.assertClose(new_verts, gt_subdivide_verts)
+        self.assertClose(new_faces, gt_subdivide_faces)
         self.assertTrue(new_verts.requires_grad == verts.requires_grad)
+
+    def test_simple_subdivide(self):
+        self.simple_subdivide()
+
+    def test_simple_subdivide_with_init(self):
+        self.simple_subdivide(with_init=True)
 
     def test_heterogeneous_meshes(self):
         device = torch.device("cuda:0")
@@ -71,25 +78,14 @@ class TestSubdivideMeshes(unittest.TestCase):
         )
         faces1 = torch.tensor([[0, 1, 2]], dtype=torch.int64, device=device)
         verts2 = torch.tensor(
-            [
-                [0.5, 1.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [1.5, 1.0, 0.0],
-            ],
+            [[0.5, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.5, 1.0, 0.0]],
             dtype=torch.float32,
             device=device,
             requires_grad=True,
         )
-        faces2 = torch.tensor(
-            [[0, 1, 2], [0, 3, 1]], dtype=torch.int64, device=device
-        )
-        faces3 = torch.tensor(
-            [[0, 1, 2], [0, 2, 3]], dtype=torch.int64, device=device
-        )
-        mesh = Meshes(
-            verts=[verts1, verts2, verts2], faces=[faces1, faces2, faces3]
-        )
+        faces2 = torch.tensor([[0, 1, 2], [0, 3, 1]], dtype=torch.int64, device=device)
+        faces3 = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int64, device=device)
+        mesh = Meshes(verts=[verts1, verts2, verts2], faces=[faces1, faces2, faces3])
         subdivide = SubdivideMeshes()
         new_mesh = subdivide(mesh.clone())
 
@@ -186,12 +182,12 @@ class TestSubdivideMeshes(unittest.TestCase):
         new_mesh_verts1, new_mesh_faces1 = new_mesh.get_mesh_verts_faces(0)
         new_mesh_verts2, new_mesh_faces2 = new_mesh.get_mesh_verts_faces(1)
         new_mesh_verts3, new_mesh_faces3 = new_mesh.get_mesh_verts_faces(2)
-        self.assertTrue(torch.allclose(new_mesh_verts1, gt_subdivided_verts1))
-        self.assertTrue(torch.allclose(new_mesh_faces1, gt_subdivided_faces1))
-        self.assertTrue(torch.allclose(new_mesh_verts2, gt_subdivided_verts2))
-        self.assertTrue(torch.allclose(new_mesh_faces2, gt_subdivided_faces2))
-        self.assertTrue(torch.allclose(new_mesh_verts3, gt_subdivided_verts3))
-        self.assertTrue(torch.allclose(new_mesh_faces3, gt_subdivided_faces3))
+        self.assertClose(new_mesh_verts1, gt_subdivided_verts1)
+        self.assertClose(new_mesh_faces1, gt_subdivided_faces1)
+        self.assertClose(new_mesh_verts2, gt_subdivided_verts2)
+        self.assertClose(new_mesh_faces2, gt_subdivided_faces2)
+        self.assertClose(new_mesh_verts3, gt_subdivided_verts3)
+        self.assertClose(new_mesh_faces3, gt_subdivided_faces3)
         self.assertTrue(new_mesh_verts1.requires_grad == verts1.requires_grad)
         self.assertTrue(new_mesh_verts2.requires_grad == verts2.requires_grad)
         self.assertTrue(new_mesh_verts3.requires_grad == verts2.requires_grad)
@@ -213,13 +209,11 @@ class TestSubdivideMeshes(unittest.TestCase):
         gt_feats = torch.cat(
             (feats.view(N, V, D), app_feats.view(N, -1, D)), dim=1
         ).view(-1, D)
-        self.assertTrue(torch.allclose(new_feats, gt_feats))
+        self.assertClose(new_feats, gt_feats)
         self.assertTrue(new_feats.requires_grad == gt_feats.requires_grad)
 
     @staticmethod
-    def subdivide_meshes_with_init(
-        num_meshes: int = 10, same_topo: bool = False
-    ):
+    def subdivide_meshes_with_init(num_meshes: int = 10, same_topo: bool = False):
         device = torch.device("cuda:0")
         meshes = ico_sphere(0, device=device)
         if num_meshes > 1:

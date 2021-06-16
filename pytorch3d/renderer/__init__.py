@@ -6,31 +6,64 @@ from .blending import (
     sigmoid_alpha_blend,
     softmax_rgb_blend,
 )
+from .camera_utils import rotate_on_spot
+from .cameras import OpenGLOrthographicCameras  # deprecated
+from .cameras import OpenGLPerspectiveCameras  # deprecated
+from .cameras import SfMOrthographicCameras  # deprecated
+from .cameras import SfMPerspectiveCameras  # deprecated
 from .cameras import (
-    OpenGLOrthographicCameras,
-    OpenGLPerspectiveCameras,
+    FoVOrthographicCameras,
+    FoVPerspectiveCameras,
+    OrthographicCameras,
+    PerspectiveCameras,
     camera_position_from_spherical_angles,
     get_world_to_view_transform,
     look_at_rotation,
     look_at_view_transform,
 )
-from .lighting import DirectionalLights, PointLights, diffuse, specular
+from .implicit import (
+    AbsorptionOnlyRaymarcher,
+    EmissionAbsorptionRaymarcher,
+    GridRaysampler,
+    ImplicitRenderer,
+    MonteCarloRaysampler,
+    NDCGridRaysampler,
+    RayBundle,
+    VolumeRenderer,
+    VolumeSampler,
+    ray_bundle_to_ray_points,
+    ray_bundle_variables_to_ray_points,
+)
+from .lighting import AmbientLights, DirectionalLights, PointLights, diffuse, specular
 from .materials import Materials
 from .mesh import (
-    GouradShader,
+    HardFlatShader,
+    HardGouraudShader,
+    HardPhongShader,
     MeshRasterizer,
     MeshRenderer,
-    PhongShader,
     RasterizationSettings,
-    SilhouetteShader,
-    TexturedPhongShader,
-    gourad_shading,
-    interpolate_face_attributes,
-    interpolate_texture_map,
-    interpolate_vertex_colors,
+    SoftGouraudShader,
+    SoftPhongShader,
+    SoftSilhouetteShader,
+    Textures,
+    TexturesAtlas,
+    TexturesUV,
+    TexturesVertex,
+    gouraud_shading,
     phong_shading,
     rasterize_meshes,
 )
+from .points import (
+    AlphaCompositor,
+    NormWeightedCompositor,
+    PointsRasterizationSettings,
+    PointsRasterizer,
+    PointsRenderer,
+    PulsarPointsRenderer,
+    rasterize_points,
+)
 from .utils import TensorProperties, convert_to_tensors_and_broadcast
+
 
 __all__ = [k for k in globals().keys() if not k.startswith("_")]

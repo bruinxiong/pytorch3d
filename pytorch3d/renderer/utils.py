@@ -1,13 +1,19 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
-import numpy as np
+import copy
+import inspect
+import warnings
 from typing import Any, Union
+
+import numpy as np
 import torch
+import torch.nn as nn
+
+from ..common.types import Device, make_device
 
 
-class TensorAccessor(object):
+class TensorAccessor(nn.Module):
     """
     A helper class to be used with the __getitem__ method. This can be used for
     getting/setting the values for an attribute of a class at one particular
@@ -45,10 +51,7 @@ class TensorAccessor(object):
         # Convert the attribute to a tensor if it is not a tensor.
         if not torch.is_tensor(value):
             value = torch.tensor(
-                value,
-                device=v.device,
-                dtype=v.dtype,
-                requires_grad=v.requires_grad,
+                value, device=v.device, dtype=v.dtype, requires_grad=v.requires_grad
             )
 
         # Check the shapes match the existing shape and the shape of the index.
@@ -75,29 +78,31 @@ class TensorAccessor(object):
         if hasattr(self.class_object, name):
             return self.class_object.__dict__[name][self.index]
         else:
-            msg = "Attribue %s not found on %r"
+            msg = "Attribute %s not found on %r"
             return AttributeError(msg % (name, self.class_object.__name__))
 
 
 BROADCAST_TYPES = (float, int, list, tuple, torch.Tensor, np.ndarray)
 
 
-class TensorProperties(object):
+class TensorProperties(nn.Module):
     """
     A mix-in class for storing tensors as properties with helper methods.
     """
 
-    def __init__(self, dtype=torch.float32, device="cpu", **kwargs):
+    def __init__(
+        self, dtype: torch.dtype = torch.float32, device: Device = "cpu", **kwargs
+    ):
         """
         Args:
             dtype: data type to set for the inputs
-            device: str or torch.device
+            device: Device (as str or torch.device)
             kwargs: any number of keyword arguments. Any arguments which are
-                of type (float/int/tuple/tensor/array) are broadcasted and
+                of type (float/int/list/tuple/tensor/array) are broadcasted and
                 other keyword arguments are set as attributes.
         """
         super().__init__()
-        self.device = device
+        self.device = make_device(device)
         self._N = 0
         if kwargs is not None:
 
@@ -105,13 +110,13 @@ class TensorProperties(object):
             # set as attributes anything else e.g. strings, bools
             args_to_broadcast = {}
             for k, v in kwargs.items():
-                if isinstance(v, (str, bool)):
+                if v is None or isinstance(v, (str, bool)):
                     setattr(self, k, v)
-                elif isinstance(v, BROADCAST_TYPES):
+                elif isinstance(v, BROADCAST_TYPES):  # pyre-fixme[6]
                     args_to_broadcast[k] = v
                 else:
                     msg = "Arg %s with type %r is not broadcastable"
-                    print(msg % (k, type(v)))
+                    warnings.warn(msg % (k, type(v)))
 
             names = args_to_broadcast.keys()
             # convert from type dict.values to tuple
@@ -151,17 +156,18 @@ class TensorProperties(object):
         msg = "Expected index of type int or slice; got %r"
         raise ValueError(msg % type(index))
 
-    def to(self, device: str = "cpu"):
+    def to(self, device: Device = "cpu"):
         """
         In place operation to move class properties which are tensors to a
         specified device. If self has a property "device", update this as well.
         """
+        device_ = make_device(device)
         for k in dir(self):
             v = getattr(self, k)
             if k == "device":
-                setattr(self, k, device)
-            if torch.is_tensor(v) and v.device != device:
-                setattr(self, k, v.to(device))
+                setattr(self, k, device_)
+            if torch.is_tensor(v) and v.device != device_:
+                setattr(self, k, v.to(device_))
         return self
 
     def clone(self, other):
@@ -170,10 +176,13 @@ class TensorProperties(object):
         """
         for k in dir(self):
             v = getattr(self, k)
-            if k == "device":
-                setattr(self, k, v)
+            if inspect.ismethod(v) or k.startswith("__"):
+                continue
             if torch.is_tensor(v):
-                setattr(other, k, v.clone())
+                v_clone = v.clone()
+            else:
+                v_clone = copy.deepcopy(v)
+            setattr(other, k, v_clone)
         return other
 
     def gather_props(self, batch_idx):
@@ -223,33 +232,38 @@ class TensorProperties(object):
             self with all properties reshaped. e.g. a property with shape (N, 3)
             is transformed to shape (B, 3).
         """
+        # Iterate through the attributes of the class which are tensors.
         for k in dir(self):
             v = getattr(self, k)
             if torch.is_tensor(v):
                 if v.shape[0] > 1:
                     # There are different values for each batch element
-                    # so gather these using the batch_idx
-                    idx_dims = batch_idx.shape
+                    # so gather these using the batch_idx.
+                    # First clone the input batch_idx tensor before
+                    # modifying it.
+                    _batch_idx = batch_idx.clone()
+                    idx_dims = _batch_idx.shape
                     tensor_dims = v.shape
                     if len(idx_dims) > len(tensor_dims):
                         msg = "batch_idx cannot have more dimensions than %s. "
                         msg += "got shape %r and %s has shape %r"
                         raise ValueError(msg % (k, idx_dims, k, tensor_dims))
                     if idx_dims != tensor_dims:
-                        # To use torch.gather the index tensor (batch_idx) has
+                        # To use torch.gather the index tensor (_batch_idx) has
                         # to have the same shape as the input tensor.
                         new_dims = len(tensor_dims) - len(idx_dims)
                         new_shape = idx_dims + (1,) * new_dims
                         expand_dims = (-1,) + tensor_dims[1:]
-                        batch_idx = batch_idx.view(*new_shape)
-                        batch_idx = batch_idx.expand(*expand_dims)
-                    v = v.gather(0, batch_idx)
+                        _batch_idx = _batch_idx.view(*new_shape)
+                        _batch_idx = _batch_idx.expand(*expand_dims)
+
+                    v = v.gather(0, _batch_idx)
                     setattr(self, k, v)
         return self
 
 
 def format_tensor(
-    input, dtype=torch.float32, device: str = "cpu"
+    input, dtype: torch.dtype = torch.float32, device: Device = "cpu"
 ) -> torch.Tensor:
     """
     Helper function for converting a scalar value to a tensor.
@@ -257,22 +271,27 @@ def format_tensor(
     Args:
         input: Python scalar, Python list/tuple, torch scalar, 1D torch tensor
         dtype: data type for the input
-        device: torch device on which the tensor should be placed.
+        device: Device (as str or torch.device) on which the tensor should be placed.
 
     Returns:
         input_vec: torch tensor with optional added batch dimension.
     """
+    device_ = make_device(device)
     if not torch.is_tensor(input):
-        input = torch.tensor(input, dtype=dtype, device=device)
+        input = torch.tensor(input, dtype=dtype, device=device_)
+
     if input.dim() == 0:
         input = input.view(1)
-    if input.device != device:
-        input = input.to(device=device)
+
+    if input.device == device_:
+        return input
+
+    input = input.to(device=device)
     return input
 
 
 def convert_to_tensors_and_broadcast(
-    *args, dtype=torch.float32, device: str = "cpu"
+    *args, dtype: torch.dtype = torch.float32, device: Device = "cpu"
 ):
     """
     Helper function to handle parsing an arbitrary number of inputs (*args)
@@ -304,7 +323,7 @@ def convert_to_tensors_and_broadcast(
     args_Nd = []
     for c in args_1d:
         if c.shape[0] != 1 and c.shape[0] != N:
-            msg = "Got non-broadcastable sizes %r" % (sizes)
+            msg = "Got non-broadcastable sizes %r" % sizes
             raise ValueError(msg)
 
         # Expand broadcast dim and keep non broadcast dims the same size

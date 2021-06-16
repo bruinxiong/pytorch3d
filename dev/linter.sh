@@ -13,18 +13,27 @@
 }
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-DIR="${DIR}/.."
+DIR=$(dirname "${DIR}")
 
 echo "Running isort..."
 isort -y -sp "${DIR}"
 
 echo "Running black..."
-black -l 80 "${DIR}"
+black "${DIR}"
 
 echo "Running flake..."
-flake8 "${DIR}"
+flake8 "${DIR}" || true
 
 echo "Running clang-format ..."
-find "${DIR}" -regex ".*\.\(cpp\|c\|cc\|cu\|cuh\|cxx\|h\|hh\|hpp\|hxx\|tcc\|mm\|m\)" -print0 | xargs -0 clang-format -i
+clangformat=$(command -v clang-format-8 || echo clang-format)
+find "${DIR}" -regex ".*\.\(cpp\|c\|cc\|cu\|cuh\|cxx\|h\|hh\|hpp\|hxx\|tcc\|mm\|m\)" -print0 | xargs -0 "${clangformat}" -i
 
-(cd "${DIR}"; command -v arc > /dev/null && arc lint) || true
+# Run arc and pyre internally only.
+if [[ -f "${DIR}/tests/TARGETS" ]]
+then
+  (cd "${DIR}"; command -v arc > /dev/null && arc lint) || true
+
+  echo "Running pyre..."
+  echo "To restart/kill pyre server, run 'pyre restart' or 'pyre kill' in fbcode/"
+  ( cd ~/fbsource/fbcode; pyre -l vision/fair/pytorch3d/ )
+fi

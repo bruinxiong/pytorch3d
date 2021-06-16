@@ -1,11 +1,12 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 from typing import Tuple
-import torch
 
-from .texturing import interpolate_face_attributes
+import torch
+from pytorch3d.ops import interpolate_face_attributes
+
+from .textures import TexturesVertex
 
 
 def _apply_lighting(
@@ -13,8 +14,8 @@ def _apply_lighting(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Args:
-        points: torch tensor of shape (N, P, 3) or (P, 3).
-        normals: torch tensor of shape (N, P, 3) or (P, 3)
+        points: torch tensor of shape (N, ..., 3) or (P, 3).
+        normals: torch tensor of shape (N, ..., 3) or (P, 3)
         lights: instance of the Lights class.
         cameras: instance of the Cameras class.
         materials: instance of the Materials class.
@@ -34,6 +35,7 @@ def _apply_lighting(
     ambient_color = materials.ambient_color * lights.ambient_color
     diffuse_color = materials.diffuse_color * light_diffuse
     specular_color = materials.specular_color * light_specular
+
     if normals.dim() == 2 and points.dim() == 2:
         # If given packed inputs remove batch dim in output.
         return (
@@ -41,6 +43,11 @@ def _apply_lighting(
             diffuse_color.squeeze(),
             specular_color.squeeze(),
         )
+
+    if ambient_color.ndim != diffuse_color.ndim:
+        # Reshape from (N, 3) to have dimensions compatible with
+        # diffuse_color which is of shape (N, H, W, K, 3)
+        ambient_color = ambient_color[:, None, None, None, :]
     return ambient_color, diffuse_color, specular_color
 
 
@@ -70,8 +77,12 @@ def phong_shading(
     vertex_normals = meshes.verts_normals_packed()  # (V, 3)
     faces_verts = verts[faces]
     faces_normals = vertex_normals[faces]
-    pixel_coords = interpolate_face_attributes(fragments, faces_verts)
-    pixel_normals = interpolate_face_attributes(fragments, faces_normals)
+    pixel_coords = interpolate_face_attributes(
+        fragments.pix_to_face, fragments.bary_coords, faces_verts
+    )
+    pixel_normals = interpolate_face_attributes(
+        fragments.pix_to_face, fragments.bary_coords, faces_normals
+    )
     ambient, diffuse, specular = _apply_lighting(
         pixel_coords, pixel_normals, lights, cameras, materials
     )
@@ -79,9 +90,7 @@ def phong_shading(
     return colors
 
 
-def gourad_shading(
-    meshes, fragments, lights, cameras, materials
-) -> torch.Tensor:
+def gouraud_shading(meshes, fragments, lights, cameras, materials) -> torch.Tensor:
     """
     Apply per vertex shading. First compute the vertex illumination by applying
     ambient, diffuse and specular lighting. If vertex color is available,
@@ -89,6 +98,9 @@ def gourad_shading(
     and add the specular component to determine the vertex shaded color.
     Then interpolate the vertex shaded colors using the barycentric coordinates
     to get a color per pixel.
+
+    Gouraud shading is only supported for meshes with texture type `TexturesVertex`.
+    This is because the illumination is applied to the vertex colors.
 
     Args:
         meshes: Batch of meshes
@@ -100,10 +112,13 @@ def gourad_shading(
     Returns:
         colors: (N, H, W, K, 3)
     """
+    if not isinstance(meshes.textures, TexturesVertex):
+        raise ValueError("Mesh textures must be an instance of TexturesVertex")
+
     faces = meshes.faces_packed()  # (F, 3)
-    verts = meshes.verts_packed()
-    vertex_normals = meshes.verts_normals_packed()  # (V, 3)
-    vertex_colors = meshes.textures.verts_rgb_packed()
+    verts = meshes.verts_packed()  # (V, 3)
+    verts_normals = meshes.verts_normals_packed()  # (V, 3)
+    verts_colors = meshes.textures.verts_features_packed()  # (V, D)
     vert_to_mesh_idx = meshes.verts_packed_to_mesh_idx()
 
     # Format properties of lights and materials so they are compatible
@@ -118,9 +133,59 @@ def gourad_shading(
 
     # Calculate the illumination at each vertex
     ambient, diffuse, specular = _apply_lighting(
-        verts, vertex_normals, lights, cameras, materials
+        verts, verts_normals, lights, cameras, materials
     )
-    verts_colors_shaded = vertex_colors * (ambient + diffuse) + specular
+
+    verts_colors_shaded = verts_colors * (ambient + diffuse) + specular
     face_colors = verts_colors_shaded[faces]
-    colors = interpolate_face_attributes(fragments, face_colors)
+    colors = interpolate_face_attributes(
+        fragments.pix_to_face, fragments.bary_coords, face_colors
+    )
+    return colors
+
+
+def flat_shading(meshes, fragments, lights, cameras, materials, texels) -> torch.Tensor:
+    """
+    Apply per face shading. Use the average face position and the face normals
+    to compute the ambient, diffuse and specular lighting. Apply the ambient
+    and diffuse color to the pixel color and add the specular component to
+    determine the final pixel color.
+
+    Args:
+        meshes: Batch of meshes
+        fragments: Fragments named tuple with the outputs of rasterization
+        lights: Lights class containing a batch of lights parameters
+        cameras: Cameras class containing a batch of cameras parameters
+        materials: Materials class containing a batch of material properties
+        texels: texture per pixel of shape (N, H, W, K, 3)
+
+    Returns:
+        colors: (N, H, W, K, 3)
+    """
+    verts = meshes.verts_packed()  # (V, 3)
+    faces = meshes.faces_packed()  # (F, 3)
+    face_normals = meshes.faces_normals_packed()  # (V, 3)
+    faces_verts = verts[faces]
+    face_coords = faces_verts.mean(dim=-2)  # (F, 3, XYZ) mean xyz across verts
+
+    # Replace empty pixels in pix_to_face with 0 in order to interpolate.
+    mask = fragments.pix_to_face == -1
+    pix_to_face = fragments.pix_to_face.clone()
+    pix_to_face[mask] = 0
+
+    N, H, W, K = pix_to_face.shape
+    idx = pix_to_face.view(N * H * W * K, 1).expand(N * H * W * K, 3)
+
+    # gather pixel coords
+    pixel_coords = face_coords.gather(0, idx).view(N, H, W, K, 3)
+    pixel_coords[mask] = 0.0
+    # gather pixel normals
+    pixel_normals = face_normals.gather(0, idx).view(N, H, W, K, 3)
+    pixel_normals[mask] = 0.0
+
+    # Calculate the illumination at each face
+    ambient, diffuse, specular = _apply_lighting(
+        pixel_coords, pixel_normals, lights, cameras, materials
+    )
+    colors = (ambient + diffuse) * texels + specular
     return colors

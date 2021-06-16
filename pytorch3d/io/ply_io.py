@@ -1,18 +1,34 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
 
-"""This module implements utility functions for loading and saving meshes."""
-import numpy as np
-import pathlib
+"""
+This module implements utility functions for loading and saving
+meshes and point clouds as PLY files.
+"""
+import itertools
 import struct
 import sys
 import warnings
 from collections import namedtuple
-from typing import Optional, Tuple
+from io import BytesIO, TextIOBase
+from pathlib import Path
+from typing import List, Optional, Tuple, Union, cast
+
+import numpy as np
 import torch
+from iopath.common.file_io import PathManager
+from pytorch3d.io.utils import _check_faces_indices, _make_tensor, _open_file
+from pytorch3d.renderer import TexturesVertex
+from pytorch3d.structures import Meshes, Pointclouds
+
+from .pluggable_formats import (
+    MeshFormatInterpreter,
+    PointcloudFormatInterpreter,
+    endswith,
+)
+
 
 _PlyTypeData = namedtuple("_PlyTypeData", "size struct_char np_type")
 
@@ -25,6 +41,14 @@ _PLY_TYPES = {
     "uint": _PlyTypeData(4, "I", np.uint32),
     "float": _PlyTypeData(4, "f", np.float32),
     "double": _PlyTypeData(8, "d", np.float64),
+    "int8": _PlyTypeData(1, "b", np.byte),
+    "uint8": _PlyTypeData(1, "B", np.ubyte),
+    "int16": _PlyTypeData(2, "h", np.short),
+    "uint16": _PlyTypeData(2, "H", np.ushort),
+    "int32": _PlyTypeData(4, "i", np.int32),
+    "uint32": _PlyTypeData(4, "I", np.uint32),
+    "float32": _PlyTypeData(4, "f", np.float32),
+    "float64": _PlyTypeData(8, "d", np.float64),
 }
 
 _Property = namedtuple("_Property", "name data_type list_size_type")
@@ -43,7 +67,7 @@ class _PlyElementType:
     def __init__(self, name: str, count: int):
         self.name = name
         self.count = count
-        self.properties = []
+        self.properties: List[_Property] = []
 
     def add_property(
         self, name: str, data_type: str, list_size_type: Optional[str] = None
@@ -83,9 +107,9 @@ class _PlyElementType:
         """
         if not self.is_fixed_size():
             return False
-        first_type = self.properties[0].data_type
+        first_type = _PLY_TYPES[self.properties[0].data_type]
         for property in self.properties:
-            if property.data_type != first_type:
+            if _PLY_TYPES[property.data_type] != first_type:
                 return False
         return True
 
@@ -111,7 +135,7 @@ class _PlyHeader:
             self.elements:   (List[_PlyElementType]) element description
             self.ascii:      (bool) Whether in ascii format
             self.big_endian: (bool) (if not ascii) whether big endian
-            self.obj_info:   (dict) arbitrary extra data
+            self.obj_info:   (List[str]) arbitrary extra data
 
         Args:
             f: file-like object.
@@ -119,8 +143,8 @@ class _PlyHeader:
         if f.readline() not in [b"ply\n", b"ply\r\n", "ply\n"]:
             raise ValueError("Invalid file header.")
         seen_format = False
-        self.elements = []
-        self.obj_info = {}
+        self.elements: List[_PlyElementType] = []
+        self.obj_info = []
         while True:
             line = f.readline()
             if isinstance(line, bytes):
@@ -156,11 +180,8 @@ class _PlyHeader:
             if line.startswith("element"):
                 self._parse_element(line)
                 continue
-            if line.startswith("obj_info"):
-                items = line.split(" ")
-                if len(items) != 3:
-                    raise ValueError("Invalid line: %s" % line)
-                self.obj_info[items[1]] = items[2]
+            if line.startswith("obj_info "):
+                self.obj_info.append(line[9:])
                 continue
             if line.startswith("property"):
                 self._parse_property(line)
@@ -217,23 +238,88 @@ def _read_ply_fixed_size_element_ascii(f, definition: _PlyElementType):
     Given an element which has no lists and one type, read the
     corresponding data.
 
+    For example
+
+        element vertex 8
+        property float x
+        property float y
+        property float z
+
     Args:
         f: file-like object being read.
         definition: The element object which describes what we are reading.
 
     Returns:
-        2D numpy array corresponding to the data. The rows are the different
-        values. There is one column for each property.
+        1-element list containing a 2D numpy array corresponding to the data.
+        The rows are the different values. There is one column for each property.
     """
     np_type = _PLY_TYPES[definition.properties[0].data_type].np_type
-    data = np.loadtxt(
-        f, dtype=np_type, comments=None, ndmin=2, max_rows=definition.count
-    )
+    old_offset = f.tell()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=".* Empty input file.*", category=UserWarning
+        )
+        data = np.loadtxt(
+            f, dtype=np_type, comments=None, ndmin=2, max_rows=definition.count
+        )
+    if not len(data):  # np.loadtxt() seeks even on empty data
+        f.seek(old_offset)
     if data.shape[1] != len(definition.properties):
         raise ValueError("Inconsistent data for %s." % definition.name)
     if data.shape[0] != definition.count:
         raise ValueError("Not enough data for %s." % definition.name)
-    return data
+    return [data]
+
+
+def _read_ply_nolist_element_ascii(f, definition: _PlyElementType):
+    """
+    Given an element which has no lists and multiple types, read the
+    corresponding data, by loading all the data as float64 and converting
+    the relevant parts later.
+
+    For example, given
+
+        element vertex 8
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+
+    the output will have two arrays, the first containing (x,y,z)
+    and the second (red,green,blue).
+
+    Args:
+        f: file-like object being read.
+        definition: The element object which describes what we are reading.
+
+    Returns:
+        List of 2D numpy arrays corresponding to the data.
+    """
+    old_offset = f.tell()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=".* Empty input file.*", category=UserWarning
+        )
+        data = np.loadtxt(
+            f, dtype=np.float64, comments=None, ndmin=2, max_rows=definition.count
+        )
+    if not len(data):  # np.loadtxt() seeks even on empty data
+        f.seek(old_offset)
+    if data.shape[1] != len(definition.properties):
+        raise ValueError("Inconsistent data for %s." % definition.name)
+    if data.shape[0] != definition.count:
+        raise ValueError("Not enough data for %s." % definition.name)
+    pieces = []
+    offset = 0
+    for dtype, it in itertools.groupby(p.data_type for p in definition.properties):
+        count = sum(1 for _ in it)
+        end_offset = offset + count
+        piece = data[:, offset:end_offset].astype(_PLY_TYPES[dtype].np_type)
+        pieces.append(piece)
+        offset = end_offset
+    return pieces
 
 
 def _try_read_ply_constant_list_ascii(f, definition: _PlyElementType):
@@ -241,6 +327,28 @@ def _try_read_ply_constant_list_ascii(f, definition: _PlyElementType):
     If definition is an element which is a single list, attempt to read the
     corresponding data assuming every value has the same length.
     If the data is ragged, return None and leave f undisturbed.
+
+    For example, if the element is
+
+        element face 2
+        property list uchar int vertex_index
+
+    and the data is
+
+        4 0 1 2 3
+        4 7 6 5 4
+
+    then the function will return
+
+        [[0, 1, 2, 3],
+         [7, 6, 5, 4]]
+
+    but if the data is
+
+        4 0 1 2 3
+        3 6 5 4
+
+    then the function will return None.
 
     Args:
         f: file-like object being read.
@@ -251,23 +359,21 @@ def _try_read_ply_constant_list_ascii(f, definition: _PlyElementType):
         data. The rows are the different values. Otherwise None.
     """
     np_type = _PLY_TYPES[definition.properties[0].data_type].np_type
-    start_point = f.tell()
+    old_offset = f.tell()
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message=".* Empty input file.*", category=UserWarning
             )
             data = np.loadtxt(
-                f,
-                dtype=np_type,
-                comments=None,
-                ndmin=2,
-                max_rows=definition.count,
+                f, dtype=np_type, comments=None, ndmin=2, max_rows=definition.count
             )
     except ValueError:
-        f.seek(start_point)
+        f.seek(old_offset)
         return None
-    if (data.shape[1] - 1 != data[:, 0]).any():
+    if not len(data):  # np.loadtxt() seeks even on empty data
+        f.seek(old_offset)
+    if (data[:, 0] != data.shape[1] - 1).any():
         msg = "A line of %s data did not have the specified length."
         raise ValueError(msg % definition.name)
     if data.shape[0] != definition.count:
@@ -275,7 +381,7 @@ def _try_read_ply_constant_list_ascii(f, definition: _PlyElementType):
     return data[:, 1:]
 
 
-def _parse_heterogenous_property_ascii(datum, line_iter, property: _Property):
+def _parse_heterogeneous_property_ascii(datum, line_iter, property: _Property):
     """
     Read a general data property from an ascii .ply file.
 
@@ -302,9 +408,7 @@ def _parse_heterogenous_property_ascii(datum, line_iter, property: _Property):
             length = int(value)
         except ValueError:
             raise ValueError("A list length was not a number.")
-        list_value = np.zeros(
-            length, dtype=_PLY_TYPES[property.data_type].np_type
-        )
+        list_value = np.zeros(length, dtype=_PLY_TYPES[property.data_type].np_type)
         for i in range(length):
             inner_value = next(line_iter, None)
             if inner_value is None:
@@ -328,11 +432,15 @@ def _read_ply_element_ascii(f, definition: _PlyElementType):
         In simple cases where every element has the same size, 2D numpy array
         corresponding to the data. The rows are the different values.
         Otherwise a list of lists of values, where the outer list is
-        each occurence of the element, and the inner lists have one value per
+        each occurrence of the element, and the inner lists have one value per
         property.
     """
+    if not definition.count:
+        return []
     if definition.is_constant_type_fixed_size():
         return _read_ply_fixed_size_element_ascii(f, definition)
+    if definition.is_fixed_size():
+        return _read_ply_nolist_element_ascii(f, definition)
     if definition.try_constant_list():
         data = _try_read_ply_constant_list_ascii(f, definition)
         if data is not None:
@@ -347,10 +455,40 @@ def _read_ply_element_ascii(f, definition: _PlyElementType):
         datum = []
         line_iter = iter(line_string.strip().split())
         for property in definition.properties:
-            _parse_heterogenous_property_ascii(datum, line_iter, property)
+            _parse_heterogeneous_property_ascii(datum, line_iter, property)
         data.append(datum)
         if next(line_iter, None) is not None:
             raise ValueError("Too much data for an element.")
+    return data
+
+
+def _read_raw_array(f, aim: str, length: int, dtype: type = np.uint8, dtype_size=1):
+    """
+    Read [length] elements from a file.
+
+    Args:
+        f: file object
+        aim: name of target for error message
+        length: number of elements
+        dtype: numpy type
+        dtype_size: number of bytes per element.
+
+    Returns:
+        new numpy array
+    """
+
+    if isinstance(f, BytesIO):
+        # np.fromfile is faster but won't work on a BytesIO
+        needed_bytes = length * dtype_size
+        bytes_data = bytearray(needed_bytes)
+        n_bytes_read = f.readinto(bytes_data)
+        if n_bytes_read != needed_bytes:
+            raise ValueError("Not enough data for %s." % aim)
+        data = np.frombuffer(bytes_data, dtype=dtype)
+    else:
+        data = np.fromfile(f, dtype=dtype, count=length)
+        if data.shape[0] != length:
+            raise ValueError("Not enough data for %s." % aim)
     return data
 
 
@@ -361,65 +499,86 @@ def _read_ply_fixed_size_element_binary(
     Given an element which has no lists and one type, read the
     corresponding data.
 
+    For example
+
+        element vertex 8
+        property float x
+        property float y
+        property float z
+
+
     Args:
         f: file-like object being read.
         definition: The element object which describes what we are reading.
         big_endian: (bool) whether the document is encoded as big endian.
 
     Returns:
-        2D numpy array corresponding to the data. The rows are the different
-        values. There is one column for each property.
+        1-element list containing a 2D numpy array corresponding to the data.
+        The rows are the different values. There is one column for each property.
     """
     ply_type = _PLY_TYPES[definition.properties[0].data_type]
     np_type = ply_type.np_type
     type_size = ply_type.size
     needed_length = definition.count * len(definition.properties)
-    needed_bytes = needed_length * type_size
-    bytes_data = f.read(needed_bytes)
-    if len(bytes_data) != needed_bytes:
-        raise ValueError("Not enough data for %s." % definition.name)
-    data = np.frombuffer(bytes_data, dtype=np_type)
+    data = _read_raw_array(f, definition.name, needed_length, np_type, type_size)
 
     if (sys.byteorder == "big") != big_endian:
         data = data.byteswap()
-    return data.reshape(definition.count, len(definition.properties))
+    return [data.reshape(definition.count, len(definition.properties))]
 
 
-def _read_ply_element_struct(f, definition: _PlyElementType, endian_str: str):
+def _read_ply_element_binary_nolists(f, definition: _PlyElementType, big_endian: bool):
     """
-    Given an element which has no lists, read the corresponding data. Uses the
-    struct library.
+    Given an element which has no lists, read the corresponding data as tuple
+    of numpy arrays, one for each set of adjacent columns with the same type.
 
-    Note: It looks like struct would also support lists where
-    type=size_type=char, but it is hard to know how much data to read in that
-    case.
+    For example, given
+
+        element vertex 8
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+
+    the output will have two arrays, the first containing (x,y,z)
+    and the second (red,green,blue).
 
     Args:
         f: file-like object being read.
         definition: The element object which describes what we are reading.
-        endian_str: ">" or "<" according to whether the document is big or
-                    little endian.
+        big_endian: (bool) whether the document is encoded as big endian.
 
     Returns:
-        2D numpy array corresponding to the data. The rows are the different
-        values. There is one column for each property.
+        List of 2D numpy arrays corresponding to the data. The rows are the different
+        values.
     """
-    format = "".join(
-        _PLY_TYPES[property.data_type].struct_char
-        for property in definition.properties
-    )
-    format = endian_str + format
-    pattern = struct.Struct(format)
-    size = pattern.size
+    size = sum(_PLY_TYPES[prop.data_type].size for prop in definition.properties)
     needed_bytes = size * definition.count
-    bytes_data = f.read(needed_bytes)
-    if len(bytes_data) != needed_bytes:
-        raise ValueError("Not enough data for %s." % definition.name)
-    data = [
-        pattern.unpack_from(bytes_data, i * size)
-        for i in range(definition.count)
-    ]
-    return data
+    data = _read_raw_array(f, definition.name, needed_bytes).reshape(-1, size)
+    offset = 0
+    pieces = []
+    for dtype, it in itertools.groupby(p.data_type for p in definition.properties):
+        count = sum(1 for _ in it)
+        bytes_each = count * _PLY_TYPES[dtype].size
+        end_offset = offset + bytes_each
+
+        # what we want to do is
+        # piece = data[:, offset:end_offset].view(_PLY_TYPES[dtype].np_type)
+        # but it fails in the general case
+        # because of https://github.com/numpy/numpy/issues/9496.
+        piece = np.lib.stride_tricks.as_strided(
+            data[:1, offset:end_offset].view(_PLY_TYPES[dtype].np_type),
+            shape=(definition.count, count),
+            strides=(data.strides[0], _PLY_TYPES[dtype].size),
+        )
+
+        if (sys.byteorder == "big") != big_endian:
+            piece = piece.byteswap()
+        pieces.append(piece)
+        offset = end_offset
+    return pieces
 
 
 def _try_read_ply_constant_list_binary(
@@ -429,6 +588,28 @@ def _try_read_ply_constant_list_binary(
     If definition is an element which is a single list, attempt to read the
     corresponding data assuming every value has the same length.
     If the data is ragged, return None and leave f undisturbed.
+
+    For example, if the element is
+
+        element face 2
+        property list uchar int vertex_index
+
+    and the data is
+
+        4 0 1 2 3
+        4 7 6 5 4
+
+    then the function will return
+
+        [[0, 1, 2, 3],
+         [7, 6, 5, 4]]
+
+    but if the data is
+
+        4 0 1 2 3
+        3 6 5 4
+
+    then the function will return None.
 
     Args:
         f: file-like object being read.
@@ -451,7 +632,7 @@ def _try_read_ply_constant_list_binary(
         [length] = length_struct.unpack(bytes_data)
         return length
 
-    start_point = f.tell()
+    old_offset = f.tell()
 
     length = get_length()
     np_type = _PLY_TYPES[definition.properties[0].data_type].np_type
@@ -468,7 +649,7 @@ def _try_read_ply_constant_list_binary(
         if i + 1 == definition.count:
             break
         if length != get_length():
-            f.seek(start_point)
+            f.seek(old_offset)
             return None
     if (sys.byteorder == "big") != big_endian:
         output = output.byteswap()
@@ -476,9 +657,7 @@ def _try_read_ply_constant_list_binary(
     return output
 
 
-def _read_ply_element_binary(
-    f, definition: _PlyElementType, big_endian: bool
-) -> list:
+def _read_ply_element_binary(f, definition: _PlyElementType, big_endian: bool) -> list:
     """
     Decode all instances of a single element from a binary .ply file.
 
@@ -491,21 +670,23 @@ def _read_ply_element_binary(
         In simple cases where every element has the same size, 2D numpy array
         corresponding to the data. The rows are the different values.
         Otherwise a list of lists/tuples of values, where the outer list is
-        each occurence of the element, and the inner lists have one value per
+        each occurrence of the element, and the inner lists have one value per
         property.
     """
-    endian_str = ">" if big_endian else "<"
+    if not definition.count:
+        return []
 
     if definition.is_constant_type_fixed_size():
         return _read_ply_fixed_size_element_binary(f, definition, big_endian)
     if definition.is_fixed_size():
-        return _read_ply_element_struct(f, definition, endian_str)
+        return _read_ply_element_binary_nolists(f, definition, big_endian)
     if definition.try_constant_list():
         data = _try_read_ply_constant_list_binary(f, definition, big_endian)
         if data is not None:
             return data
 
     # We failed to read the element as a lump, must process each line manually.
+    endian_str = ">" if big_endian else "<"
     property_structs = []
     for property in definition.properties:
         initial_type = property.list_size_type or property.data_type
@@ -516,9 +697,7 @@ def _read_ply_element_binary(
     data = []
     for _i in range(definition.count):
         datum = []
-        for property, property_struct in zip(
-            definition.properties, property_structs
-        ):
+        for property, property_struct in zip(definition.properties, property_structs):
             size = property_struct.size
             initial_data = f.read(size)
             if len(initial_data) != size:
@@ -562,6 +741,10 @@ def _load_ply_raw_stream(f) -> Tuple[_PlyHeader, dict]:
         for element in header.elements:
             elements[element.name] = _read_ply_element_ascii(f, element)
     else:
+        if isinstance(f, TextIOBase):
+            raise ValueError(
+                "Cannot safely read a binary ply file using a Text stream."
+            )
         big = header.big_endian
         for element in header.elements:
             elements[element.name] = _read_ply_element_binary(f, element, big)
@@ -571,7 +754,7 @@ def _load_ply_raw_stream(f) -> Tuple[_PlyHeader, dict]:
     return header, elements
 
 
-def _load_ply_raw(f) -> Tuple[_PlyHeader, dict]:
+def _load_ply_raw(f, path_manager: PathManager) -> Tuple[_PlyHeader, dict]:
     """
     Load the data from a .ply file.
 
@@ -580,33 +763,258 @@ def _load_ply_raw(f) -> Tuple[_PlyHeader, dict]:
             tell and seek), a pathlib path or a string containing a file name.
             If the ply file is binary, a text stream is not supported.
             It is recommended to use a binary stream.
+        path_manager: PathManager for loading if f is a str.
 
     Returns:
         header: A _PlyHeader object describing the metadata in the ply file.
         elements: A dictionary of element names to values. If an element is
                   regular, in the sense of having no lists or being one
                   uniformly-sized list, then the value will be a 2D numpy array.
+                  If it has no lists but more than one type, it will be a list of arrays.
                   If not, it is a list of the relevant property values.
     """
-    new_f = False
-    if isinstance(f, str):
-        new_f = True
-        f = open(f, "rb")
-    elif isinstance(f, pathlib.Path):
-        new_f = True
-        f = f.open("rb")
-    try:
+    with _open_file(f, path_manager, "rb") as f:
         header, elements = _load_ply_raw_stream(f)
-    finally:
-        if new_f:
-            f.close()
-
     return header, elements
 
 
-def load_ply(f):
+def _get_verts_column_indices(
+    vertex_head: _PlyElementType,
+) -> Tuple[List[int], Optional[List[int]], float, Optional[List[int]]]:
+    """
+    Get the columns of verts, verts_colors, and verts_normals in the vertex
+    element of a parsed ply file, together with a color scale factor.
+    When the colors are in byte format, they are scaled from 0..255 to [0,1].
+    Otherwise they are not scaled.
+
+    For example, if the vertex element looks as follows:
+
+        element vertex 892
+        property double x
+        property double y
+        property double z
+        property double nx
+        property double ny
+        property double nz
+        property uchar red
+        property uchar green
+        property uchar blue
+
+    then the return value will be ([0,1,2], [6,7,8], 1.0/255, [3,4,5])
+
+    Args:
+        vertex_head: as returned from load_ply_raw.
+
+    Returns:
+        point_idxs: List[int] of 3 point columns.
+        color_idxs: List[int] of 3 color columns if they are present,
+                    otherwise None.
+        color_scale: value to scale colors by.
+        normal_idxs: List[int] of 3 normals columns if they are present,
+                    otherwise None.
+    """
+    point_idxs: List[Optional[int]] = [None, None, None]
+    color_idxs: List[Optional[int]] = [None, None, None]
+    normal_idxs: List[Optional[int]] = [None, None, None]
+    for i, prop in enumerate(vertex_head.properties):
+        if prop.list_size_type is not None:
+            raise ValueError("Invalid vertices in file: did not expect list.")
+        for j, letter in enumerate(["x", "y", "z"]):
+            if prop.name == letter:
+                point_idxs[j] = i
+        for j, name in enumerate(["red", "green", "blue"]):
+            if prop.name == name:
+                color_idxs[j] = i
+        for j, name in enumerate(["nx", "ny", "nz"]):
+            if prop.name == name:
+                normal_idxs[j] = i
+    if None in point_idxs:
+        raise ValueError("Invalid vertices in file.")
+    color_scale = 1.0
+    if all(
+        idx is not None and _PLY_TYPES[vertex_head.properties[idx].data_type].size == 1
+        for idx in color_idxs
+    ):
+        color_scale = 1.0 / 255
+    return (
+        point_idxs,
+        None if None in color_idxs else cast(List[int], color_idxs),
+        color_scale,
+        None if None in normal_idxs else cast(List[int], normal_idxs),
+    )
+
+
+def _get_verts(
+    header: _PlyHeader, elements: dict
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Get the vertex locations, colors and normals from a parsed ply file.
+
+    Args:
+        header, elements: as returned from load_ply_raw.
+
+    Returns:
+        verts: FloatTensor of shape (V, 3).
+        vertex_colors: None or FloatTensor of shape (V, 3).
+        vertex_normals: None or FloatTensor of shape (V, 3).
+    """
+
+    vertex = elements.get("vertex", None)
+    if vertex is None:
+        raise ValueError("The ply file has no vertex element.")
+    if not isinstance(vertex, list):
+        raise ValueError("Invalid vertices in file.")
+    vertex_head = next(head for head in header.elements if head.name == "vertex")
+    point_idxs, color_idxs, color_scale, normal_idxs = _get_verts_column_indices(
+        vertex_head
+    )
+
+    # Case of no vertices
+    if vertex_head.count == 0:
+        verts = torch.zeros((0, 3), dtype=torch.float32)
+        if color_idxs is None:
+            return verts, None, None
+        return verts, torch.zeros((0, 3), dtype=torch.float32), None
+
+    # Simple case where the only data is the vertices themselves
+    if (
+        len(vertex) == 1
+        and isinstance(vertex[0], np.ndarray)
+        and vertex[0].ndim == 2
+        and vertex[0].shape[1] == 3
+    ):
+        return _make_tensor(vertex[0], cols=3, dtype=torch.float32), None, None
+
+    vertex_colors = None
+    vertex_normals = None
+
+    if len(vertex) == 1:
+        # This is the case where the whole vertex element has one type,
+        # so it was read as a single array and we can index straight into it.
+        verts = torch.tensor(vertex[0][:, point_idxs], dtype=torch.float32)
+        if color_idxs is not None:
+            vertex_colors = color_scale * torch.tensor(
+                vertex[0][:, color_idxs], dtype=torch.float32
+            )
+        if normal_idxs is not None:
+            vertex_normals = torch.tensor(
+                vertex[0][:, normal_idxs], dtype=torch.float32
+            )
+    else:
+        # The vertex element is heterogeneous. It was read as several arrays,
+        # part by part, where a part is a set of properties with the same type.
+        # For each property (=column in the file), we store in
+        # prop_to_partnum_col its partnum (i.e. the index of what part it is
+        # in) and its column number (its index within its part).
+        prop_to_partnum_col = [
+            (partnum, col)
+            for partnum, array in enumerate(vertex)
+            for col in range(array.shape[1])
+        ]
+        verts = torch.empty(size=(vertex_head.count, 3), dtype=torch.float32)
+        for axis in range(3):
+            partnum, col = prop_to_partnum_col[point_idxs[axis]]
+            verts.numpy()[:, axis] = vertex[partnum][:, col]
+            # Note that in the previous line, we made the assignment
+            # as numpy arrays by casting verts. If we took the (more
+            # obvious) method of converting the right hand side to
+            # torch, then we might have an extra data copy because
+            # torch wants contiguity. The code would be like:
+            #   if not vertex[partnum].flags["C_CONTIGUOUS"]:
+            #      vertex[partnum] = np.ascontiguousarray(vertex[partnum])
+            #   verts[:, axis] = torch.tensor((vertex[partnum][:, col]))
+        if color_idxs is not None:
+            vertex_colors = torch.empty(
+                size=(vertex_head.count, 3), dtype=torch.float32
+            )
+            for color in range(3):
+                partnum, col = prop_to_partnum_col[color_idxs[color]]
+                vertex_colors.numpy()[:, color] = vertex[partnum][:, col]
+            vertex_colors *= color_scale
+        if normal_idxs is not None:
+            vertex_normals = torch.empty(
+                size=(vertex_head.count, 3), dtype=torch.float32
+            )
+            for axis in range(3):
+                partnum, col = prop_to_partnum_col[normal_idxs[axis]]
+                vertex_normals.numpy()[:, axis] = vertex[partnum][:, col]
+
+    return verts, vertex_colors, vertex_normals
+
+
+def _load_ply(
+    f, *, path_manager: PathManager
+) -> Tuple[
+    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+]:
     """
     Load the data from a .ply file.
+
+    Args:
+        f:  A binary or text file-like object (with methods read, readline,
+            tell and seek), a pathlib path or a string containing a file name.
+            If the ply file is in the binary ply format rather than the text
+            ply format, then a text stream is not supported.
+            It is easiest to use a binary stream in all cases.
+        path_manager: PathManager for loading if f is a str.
+
+    Returns:
+        verts: FloatTensor of shape (V, 3).
+        faces: None or LongTensor of vertex indices, shape (F, 3).
+        vertex_colors: None or FloatTensor of shape (V, 3).
+        vertex_normals: None or FloatTensor of shape (V, 3).
+    """
+    header, elements = _load_ply_raw(f, path_manager=path_manager)
+
+    verts, vertex_colors, vertex_normals = _get_verts(header, elements)
+
+    face = elements.get("face", None)
+    if face is not None:
+        face_head = next(head for head in header.elements if head.name == "face")
+        if (
+            len(face_head.properties) != 1
+            or face_head.properties[0].list_size_type is None
+        ):
+            raise ValueError("Unexpected form of faces data.")
+        # face_head.properties[0].name is usually "vertex_index" or "vertex_indices"
+        # but we don't need to enforce this.
+
+    if face is None:
+        faces = None
+    elif not len(face):
+        # pyre is happier when this condition is not joined to the
+        # previous one with `or`.
+        faces = None
+    elif isinstance(face, np.ndarray) and face.ndim == 2:  # Homogeneous elements
+        if face.shape[1] < 3:
+            raise ValueError("Faces must have at least 3 vertices.")
+        face_arrays = [face[:, [0, i + 1, i + 2]] for i in range(face.shape[1] - 2)]
+        faces = torch.LongTensor(np.vstack(face_arrays))
+    else:
+        face_list = []
+        for face_item in face:
+            if face_item.ndim != 1:
+                raise ValueError("Bad face data.")
+            if face_item.shape[0] < 3:
+                raise ValueError("Faces must have at least 3 vertices.")
+            for i in range(face_item.shape[0] - 2):
+                face_list.append([face_item[0], face_item[i + 1], face_item[i + 2]])
+        faces = torch.tensor(face_list, dtype=torch.int64)
+
+    if faces is not None:
+        _check_faces_indices(faces, max_index=verts.shape[0])
+
+    return verts, faces, vertex_colors, vertex_normals
+
+
+def load_ply(
+    f, *, path_manager: Optional[PathManager] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Load the verts and faces from a .ply file.
+    Note that the preferred way to load data from such a file
+    is to use the IO.load_mesh and IO.load_pointcloud functions,
+    which can read more of the data.
 
     Example .ply file format:
 
@@ -642,89 +1050,128 @@ def load_ply(f):
             If the ply file is in the binary ply format rather than the text
             ply format, then a text stream is not supported.
             It is easiest to use a binary stream in all cases.
+        path_manager: PathManager for loading if f is a str.
 
     Returns:
         verts: FloatTensor of shape (V, 3).
         faces: LongTensor of vertex indices, shape (F, 3).
     """
-    header, elements = _load_ply_raw(f)
 
-    vertex = elements.get("vertex", None)
-    if vertex is None:
-        raise ValueError("The ply file has no vertex element.")
-
-    face = elements.get("face", None)
-    if face is None:
-        raise ValueError("The ply file has no face element.")
-
-    if (
-        not isinstance(vertex, np.ndarray)
-        or vertex.ndim != 2
-        or vertex.shape[1] != 3
-    ):
-        raise ValueError("Invalid vertices in file.")
-    verts = torch.tensor(vertex, dtype=torch.float32)
-
-    face_head = next(head for head in header.elements if head.name == "face")
-    if (
-        len(face_head.properties) != 1
-        or face_head.properties[0].list_size_type is None
-    ):
-        raise ValueError("Unexpected form of faces data.")
-    # face_head.properties[0].name is usually "vertex_index" or "vertex_indices"
-    # but we don't need to enforce this.
-    if isinstance(face, np.ndarray) and face.ndim == 2:
-        if face.shape[1] < 3:
-            raise ValueError("Faces must have at least 3 vertices.")
-        face_arrays = [
-            face[:, [0, i + 1, i + 2]] for i in range(face.shape[1] - 2)
-        ]
-        faces = torch.tensor(np.vstack(face_arrays), dtype=torch.int64)
-    else:
-        face_list = []
-        for face_item in face:
-            if face_item.ndim != 1:
-                raise ValueError("Bad face data.")
-            if face_item.shape[0] < 3:
-                raise ValueError("Faces must have at least 3 vertices.")
-            for i in range(face_item.shape[0] - 2):
-                face_list.append(
-                    [face_item[0], face_item[i + 1], face_item[i + 2]]
-                )
-            faces = torch.tensor(face_list, dtype=torch.int64)
+    if path_manager is None:
+        path_manager = PathManager()
+    verts, faces, _, _ = _load_ply(f, path_manager=path_manager)
+    if faces is None:
+        faces = torch.zeros(0, 3, dtype=torch.int64)
 
     return verts, faces
 
 
-def _save_ply(f, verts, faces, decimal_places: Optional[int]):
+def _save_ply(
+    f,
+    *,
+    verts: torch.Tensor,
+    faces: Optional[torch.LongTensor],
+    verts_normals: Optional[torch.Tensor],
+    verts_colors: Optional[torch.Tensor],
+    ascii: bool,
+    decimal_places: Optional[int] = None,
+) -> None:
     """
-    Internal implementation for saving a mesh to a .ply file.
+    Internal implementation for saving 3D data to a .ply file.
 
     Args:
-        f: File object to which the mesh should be written.
+        f: File object to which the 3D data should be written.
         verts: FloatTensor of shape (V, 3) giving vertex coordinates.
         faces: LongTensor of shape (F, 3) giving faces.
-        decimal_places: Number of decimal places for saving.
+        verts_normals: FloatTensor of shape (V, 3) giving vertex normals.
+        verts_colors: FloatTensor of shape (V, 3) giving vertex colors.
+        ascii: (bool) whether to use the ascii ply format.
+        decimal_places: Number of decimal places for saving if ascii=True.
     """
-    print("ply\nformat ascii 1.0", file=f)
-    print(f"element vertex {verts.shape[0]}", file=f)
-    print("property float x", file=f)
-    print("property float y", file=f)
-    print("property float z", file=f)
-    print(f"element face {faces.shape[0]}", file=f)
-    print("property list uchar int vertex_index", file=f)
-    print("end_header", file=f)
+    assert not len(verts) or (verts.dim() == 2 and verts.size(1) == 3)
+    assert faces is None or not len(faces) or (faces.dim() == 2 and faces.size(1) == 3)
+    assert verts_normals is None or (
+        verts_normals.dim() == 2 and verts_normals.size(1) == 3
+    )
+    assert verts_colors is None or (
+        verts_colors.dim() == 2 and verts_colors.size(1) == 3
+    )
 
-    if decimal_places is None:
-        float_str = "%f"
+    if ascii:
+        f.write(b"ply\nformat ascii 1.0\n")
+    elif sys.byteorder == "big":
+        f.write(b"ply\nformat binary_big_endian 1.0\n")
     else:
-        float_str = "%" + ".%df" % decimal_places
+        f.write(b"ply\nformat binary_little_endian 1.0\n")
+    f.write(f"element vertex {verts.shape[0]}\n".encode("ascii"))
+    f.write(b"property float x\n")
+    f.write(b"property float y\n")
+    f.write(b"property float z\n")
+    if verts_normals is not None:
+        f.write(b"property float nx\n")
+        f.write(b"property float ny\n")
+        f.write(b"property float nz\n")
+    if verts_colors is not None:
+        f.write(b"property float red\n")
+        f.write(b"property float green\n")
+        f.write(b"property float blue\n")
+    if len(verts) and faces is not None:
+        f.write(f"element face {faces.shape[0]}\n".encode("ascii"))
+        f.write(b"property list uchar int vertex_index\n")
+    f.write(b"end_header\n")
 
-    np.savetxt(f, verts.detach().numpy(), float_str)
-    np.savetxt(f, faces.detach().numpy(), "3 %d %d %d")
+    if not (len(verts)):
+        warnings.warn("Empty 'verts' provided")
+        return
+
+    verts_tensors = [verts]
+    if verts_normals is not None:
+        verts_tensors.append(verts_normals)
+    if verts_colors is not None:
+        verts_tensors.append(verts_colors)
+
+    vert_data = torch.cat(verts_tensors, dim=1).detach().cpu().numpy()
+    if ascii:
+        if decimal_places is None:
+            float_str = "%f"
+        else:
+            float_str = "%" + ".%df" % decimal_places
+        np.savetxt(f, vert_data, float_str)
+    else:
+        assert vert_data.dtype == np.float32
+        if isinstance(f, BytesIO):
+            # tofile only works with real files, but is faster than this.
+            f.write(vert_data.tobytes())
+        else:
+            vert_data.tofile(f)
+
+    if faces is not None:
+        faces_array = faces.detach().cpu().numpy()
+
+        _check_faces_indices(faces, max_index=verts.shape[0])
+
+        if len(faces_array):
+            if ascii:
+                np.savetxt(f, faces_array, "3 %d %d %d")
+            else:
+                # rows are 13 bytes: a one-byte 3 followed by three four-byte face indices.
+                faces_uints = np.full((len(faces_array), 13), 3, dtype=np.uint8)
+                faces_uints[:, 1:] = faces_array.astype(np.uint32).view(np.uint8)
+                if isinstance(f, BytesIO):
+                    f.write(faces_uints.tobytes())
+                else:
+                    faces_uints.tofile(f)
 
 
-def save_ply(f, verts, faces, decimal_places: Optional[int] = None):
+def save_ply(
+    f,
+    verts: torch.Tensor,
+    faces: Optional[torch.LongTensor] = None,
+    verts_normals: Optional[torch.Tensor] = None,
+    ascii: bool = False,
+    decimal_places: Optional[int] = None,
+    path_manager: Optional[PathManager] = None,
+) -> None:
     """
     Save a mesh to a .ply file.
 
@@ -732,17 +1179,180 @@ def save_ply(f, verts, faces, decimal_places: Optional[int] = None):
         f: File (or path) to which the mesh should be written.
         verts: FloatTensor of shape (V, 3) giving vertex coordinates.
         faces: LongTensor of shape (F, 3) giving faces.
-        decimal_places: Number of decimal places for saving.
+        verts_normals: FloatTensor of shape (V, 3) giving vertex normals.
+        ascii: (bool) whether to use the ascii ply format.
+        decimal_places: Number of decimal places for saving if ascii=True.
+        path_manager: PathManager for interpreting f if it is a str.
+
     """
-    new_f = False
-    if isinstance(f, str):
-        new_f = True
-        f = open(f, "w")
-    elif isinstance(f, pathlib.Path):
-        new_f = True
-        f = f.open("w")
-    try:
-        _save_ply(f, verts, faces, decimal_places)
-    finally:
-        if new_f:
-            f.close()
+
+    if len(verts) and not (verts.dim() == 2 and verts.size(1) == 3):
+        message = "Argument 'verts' should either be empty or of shape (num_verts, 3)."
+        raise ValueError(message)
+
+    if (
+        faces is not None
+        and len(faces)
+        and not (faces.dim() == 2 and faces.size(1) == 3)
+    ):
+        message = "Argument 'faces' should either be empty or of shape (num_faces, 3)."
+        raise ValueError(message)
+
+    if (
+        verts_normals is not None
+        and len(verts_normals)
+        and not (
+            verts_normals.dim() == 2
+            and verts_normals.size(1) == 3
+            and verts_normals.size(0) == verts.size(0)
+        )
+    ):
+        message = "Argument 'verts_normals' should either be empty or of shape (num_verts, 3)."
+        raise ValueError(message)
+
+    if path_manager is None:
+        path_manager = PathManager()
+    with _open_file(f, path_manager, "wb") as f:
+        _save_ply(
+            f,
+            verts=verts,
+            faces=faces,
+            verts_normals=verts_normals,
+            verts_colors=None,
+            ascii=ascii,
+            decimal_places=decimal_places,
+        )
+
+
+class MeshPlyFormat(MeshFormatInterpreter):
+    def __init__(self):
+        self.known_suffixes = (".ply",)
+
+    def read(
+        self,
+        path: Union[str, Path],
+        include_textures: bool,
+        device,
+        path_manager: PathManager,
+        **kwargs,
+    ) -> Optional[Meshes]:
+        if not endswith(path, self.known_suffixes):
+            return None
+
+        verts, faces, verts_colors, verts_normals = _load_ply(
+            f=path, path_manager=path_manager
+        )
+        if faces is None:
+            faces = torch.zeros(0, 3, dtype=torch.int64)
+
+        texture = None
+        if include_textures and verts_colors is not None:
+            texture = TexturesVertex([verts_colors.to(device)])
+
+        if verts_normals is not None:
+            verts_normals = [verts_normals]
+        mesh = Meshes(
+            verts=[verts.to(device)],
+            faces=[faces.to(device)],
+            textures=texture,
+            verts_normals=verts_normals,
+        )
+        return mesh
+
+    def save(
+        self,
+        data: Meshes,
+        path: Union[str, Path],
+        path_manager: PathManager,
+        binary: Optional[bool],
+        decimal_places: Optional[int] = None,
+        **kwargs,
+    ) -> bool:
+        if not endswith(path, self.known_suffixes):
+            return False
+
+        verts = data.verts_list()[0]
+        faces = data.faces_list()[0]
+
+        if data.has_verts_normals():
+            verts_normals = data.verts_normals_list()[0]
+        else:
+            verts_normals = None
+
+        if isinstance(data.textures, TexturesVertex):
+            mesh_verts_colors = data.textures.verts_features_list()[0]
+            n_colors = mesh_verts_colors.shape[1]
+            if n_colors == 3:
+                verts_colors = mesh_verts_colors
+            else:
+                warnings.warn(
+                    f"Texture will not be saved as it has {n_colors} colors, not 3."
+                )
+                verts_colors = None
+        else:
+            verts_colors = None
+
+        with _open_file(path, path_manager, "wb") as f:
+            _save_ply(
+                f=f,
+                verts=verts,
+                faces=faces,
+                verts_colors=verts_colors,
+                verts_normals=verts_normals,
+                ascii=binary is False,
+                decimal_places=decimal_places,
+            )
+        return True
+
+
+class PointcloudPlyFormat(PointcloudFormatInterpreter):
+    def __init__(self):
+        self.known_suffixes = (".ply",)
+
+    def read(
+        self,
+        path: Union[str, Path],
+        device,
+        path_manager: PathManager,
+        **kwargs,
+    ) -> Optional[Pointclouds]:
+        if not endswith(path, self.known_suffixes):
+            return None
+
+        verts, faces, features, normals = _load_ply(f=path, path_manager=path_manager)
+        verts = verts.to(device)
+        if features is not None:
+            features = [features.to(device)]
+        if normals is not None:
+            normals = [normals.to(device)]
+
+        pointcloud = Pointclouds(points=[verts], features=features, normals=normals)
+        return pointcloud
+
+    def save(
+        self,
+        data: Pointclouds,
+        path: Union[str, Path],
+        path_manager: PathManager,
+        binary: Optional[bool],
+        decimal_places: Optional[int] = None,
+        **kwargs,
+    ) -> bool:
+        if not endswith(path, self.known_suffixes):
+            return False
+
+        points = data.points_list()[0]
+        features = data.features_packed()
+        normals = data.normals_packed()
+
+        with _open_file(path, path_manager, "wb") as f:
+            _save_ply(
+                f=f,
+                verts=points,
+                verts_colors=features,
+                verts_normals=normals,
+                faces=None,
+                ascii=binary is False,
+                decimal_places=decimal_places,
+            )
+        return True

@@ -1,16 +1,29 @@
-#!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import unittest
-import torch
 
+import torch
 from pytorch3d.loss.mesh_normal_consistency import mesh_normal_consistency
 from pytorch3d.structures.meshes import Meshes
 from pytorch3d.utils.ico_sphere import ico_sphere
 
 
+IS_TORCH_1_8 = torch.__version__.startswith("1.8.")
+PROBLEMATIC_CUDA = torch.version.cuda in ("11.0", "11.1")
+# TODO: There are problems with cuda 11.0 and 11.1 here.
+# The symptom can be
+# RuntimeError: radix_sort: failed on 1st step: cudaErrorInvalidDevice: invalid device ordinal
+# or something like
+# operator(): block: [0,0,0], thread: [96,0,0]
+# Assertion `index >= -sizes[i] && index < sizes[i] && "index out of bounds"` failed.
+AVOID_LARGE_MESH_CUDA = PROBLEMATIC_CUDA and IS_TORCH_1_8
+
+
 class TestMeshNormalConsistency(unittest.TestCase):
+    def setUp(self) -> None:
+        torch.manual_seed(42)
+
     @staticmethod
     def init_faces(num_verts: int = 1000):
         faces = []
@@ -34,17 +47,17 @@ class TestMeshNormalConsistency(unittest.TestCase):
         return faces
 
     @staticmethod
-    def init_meshes(
-        num_meshes: int = 10, num_verts: int = 1000, num_faces: int = 3000
-    ):
-        device = torch.device("cuda:0")
+    def init_meshes(num_meshes: int = 10, num_verts: int = 1000, num_faces: int = 3000):
+        if AVOID_LARGE_MESH_CUDA:
+            device = torch.device("cpu")
+        else:
+            device = torch.device("cuda:0")
         valid_faces = TestMeshNormalConsistency.init_faces(num_verts).to(device)
         verts_list = []
         faces_list = []
         for _ in range(num_meshes):
             verts = (
-                torch.rand((num_verts, 3), dtype=torch.float32, device=device)
-                * 2.0
+                torch.rand((num_verts, 3), dtype=torch.float32, device=device) * 2.0
                 - 1.0
             )  # verts in the space of [-1, 1]
             """
@@ -99,18 +112,16 @@ class TestMeshNormalConsistency(unittest.TestCase):
                 v2 = verts_packed[v2]
                 normals.append((v1 - v0).view(-1).cross((v2 - v0).view(-1)))
             for i in range(len(normals) - 1):
-                for j in range(1, len(normals)):
-                    if i != j:
-                        mesh_idx.append(edges_packed_to_mesh_idx[e])
-                        loss.append(
-                            (
-                                1
-                                - torch.cosine_similarity(
-                                    normals[i].view(1, 3),
-                                    -normals[j].view(1, 3),
-                                )
+                for j in range(i + 1, len(normals)):
+                    mesh_idx.append(edges_packed_to_mesh_idx[e])
+                    loss.append(
+                        (
+                            1
+                            - torch.cosine_similarity(
+                                normals[i].view(1, 3), -normals[j].view(1, 3)
                             )
                         )
+                    )
 
         mesh_idx = torch.tensor(mesh_idx, device=meshes.device)
         num = mesh_idx.bincount(minlength=N)
@@ -138,9 +149,7 @@ class TestMeshNormalConsistency(unittest.TestCase):
         device = torch.device("cuda:0")
         # mesh1 shown above
         verts1 = torch.rand((4, 3), dtype=torch.float32, device=device)
-        faces1 = torch.tensor(
-            [[0, 1, 2], [2, 1, 3]], dtype=torch.int64, device=device
-        )
+        faces1 = torch.tensor([[0, 1, 2], [2, 1, 3]], dtype=torch.int64, device=device)
 
         # mesh2 is a cuboid with 8 verts, 12 faces and 18 edges
         verts2 = torch.tensor(
@@ -182,14 +191,12 @@ class TestMeshNormalConsistency(unittest.TestCase):
             [[0, 1, 2], [2, 1, 3], [2, 1, 4]], dtype=torch.int64, device=device
         )
 
-        meshes = Meshes(
-            verts=[verts1, verts2, verts3], faces=[faces1, faces2, faces3]
-        )
+        meshes = Meshes(verts=[verts1, verts2, verts3], faces=[faces1, faces2, faces3])
 
         # mesh1: normal consistency computation
         n0 = (verts1[1] - verts1[2]).cross(verts1[3] - verts1[2])
         n1 = (verts1[1] - verts1[2]).cross(verts1[0] - verts1[2])
-        loss1 = 1.0 - torch.cosine_similarity(n0.view(1, 3), -n1.view(1, 3))
+        loss1 = 1.0 - torch.cosine_similarity(n0.view(1, 3), -(n1.view(1, 3)))
 
         # mesh2: normal consistency computation
         # In the cube mesh, 6 edges are shared with coplanar faces (loss=0),
@@ -202,9 +209,9 @@ class TestMeshNormalConsistency(unittest.TestCase):
         n2 = (verts3[1] - verts3[2]).cross(verts3[4] - verts3[2])
         loss3 = (
             3.0
-            - torch.cosine_similarity(n0.view(1, 3), -n1.view(1, 3))
-            - torch.cosine_similarity(n0.view(1, 3), -n2.view(1, 3))
-            - torch.cosine_similarity(n1.view(1, 3), -n2.view(1, 3))
+            - torch.cosine_similarity(n0.view(1, 3), -(n1.view(1, 3)))
+            - torch.cosine_similarity(n0.view(1, 3), -(n2.view(1, 3)))
+            - torch.cosine_similarity(n1.view(1, 3), -(n2.view(1, 3)))
         )
         loss3 /= 3.0
 
@@ -224,6 +231,17 @@ class TestMeshNormalConsistency(unittest.TestCase):
         out2 = TestMeshNormalConsistency.mesh_normal_consistency_naive(meshes)
 
         self.assertTrue(torch.allclose(out1, out2))
+
+    def test_no_intersection(self):
+        """
+        Test Mesh Normal Consistency for a mesh known to have no
+        intersecting faces.
+        """
+        verts = torch.rand(1, 6, 3)
+        faces = torch.arange(6).reshape(1, 2, 3)
+        meshes = Meshes(verts=verts, faces=faces)
+        out = mesh_normal_consistency(meshes)
+        self.assertEqual(out.item(), 0)
 
     @staticmethod
     def mesh_normal_consistency_with_ico(

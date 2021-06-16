@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 from itertools import product
+
 import torch
 from fvcore.common.benchmark import benchmark
-
 from test_graph_conv import TestGraphConv
 
 
@@ -41,3 +40,7 @@ def bm_graph_conv() -> None:
         kwargs_list,
         warmup_iters=1,
     )
+
+
+if __name__ == "__main__":
+    bm_graph_conv()

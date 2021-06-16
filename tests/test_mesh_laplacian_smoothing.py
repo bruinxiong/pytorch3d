@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 
 import unittest
-import torch
 
+import torch
 from pytorch3d.loss.mesh_laplacian_smoothing import mesh_laplacian_smoothing
 from pytorch3d.structures.meshes import Meshes
 
@@ -57,9 +56,7 @@ class TestLaplacianSmoothing(unittest.TestCase):
         V = verts_packed.shape[0]
 
         L = torch.zeros((V, V), dtype=torch.float32, device=meshes.device)
-        inv_areas = torch.zeros(
-            (V, 1), dtype=torch.float32, device=meshes.device
-        )
+        inv_areas = torch.zeros((V, 1), dtype=torch.float32, device=meshes.device)
 
         for f in faces_packed:
             v0 = verts_packed[f[0], :]
@@ -70,9 +67,7 @@ class TestLaplacianSmoothing(unittest.TestCase):
             C = (v0 - v1).norm()
             s = 0.5 * (A + B + C)
 
-            face_area = (
-                (s * (s - A) * (s - B) * (s - C)).clamp_(min=1e-12).sqrt()
-            )
+            face_area = (s * (s - A) * (s - B) * (s - C)).clamp_(min=1e-12).sqrt()
             inv_areas[f[0]] += face_area
             inv_areas[f[1]] += face_area
             inv_areas[f[2]] += face_area
@@ -94,11 +89,12 @@ class TestLaplacianSmoothing(unittest.TestCase):
         inv_areas[idx] = 1.0 / inv_areas[idx]
 
         norm_w = L.sum(dim=1, keepdims=True)
+        L_sum = norm_w.clone()
         idx = norm_w > 0
         norm_w[idx] = 1.0 / norm_w[idx]
 
         if method == "cotcurv":
-            loss = (L.mm(verts_packed) - verts_packed) * inv_areas * 0.25
+            loss = (L.mm(verts_packed) - L_sum * verts_packed) * inv_areas * 0.25
             loss = loss.norm(dim=1)
         else:
             loss = L.mm(verts_packed) * norm_w - verts_packed
@@ -115,16 +111,13 @@ class TestLaplacianSmoothing(unittest.TestCase):
         return loss.sum() / len(meshes)
 
     @staticmethod
-    def init_meshes(
-        num_meshes: int = 10, num_verts: int = 1000, num_faces: int = 3000
-    ):
+    def init_meshes(num_meshes: int = 10, num_verts: int = 1000, num_faces: int = 3000):
         device = torch.device("cuda:0")
         verts_list = []
         faces_list = []
         for _ in range(num_meshes):
             verts = (
-                torch.rand((num_verts, 3), dtype=torch.float32, device=device)
-                * 2.0
+                torch.rand((num_verts, 3), dtype=torch.float32, device=device) * 2.0
                 - 1.0
             )  # verts in the space of [-1, 1]
             faces = torch.stack(
@@ -149,15 +142,13 @@ class TestLaplacianSmoothing(unittest.TestCase):
 
         # feats in list
         out = mesh_laplacian_smoothing(meshes, method="uniform")
-        naive_out = TestLaplacianSmoothing.laplacian_smoothing_naive_uniform(
-            meshes
-        )
+        naive_out = TestLaplacianSmoothing.laplacian_smoothing_naive_uniform(meshes)
 
         self.assertTrue(torch.allclose(out, naive_out))
 
     def test_laplacian_smoothing_cot(self):
         """
-        Test Laplacian Smoothing with uniform weights.
+        Test Laplacian Smoothing with cot weights.
         """
         meshes = TestLaplacianSmoothing.init_meshes(10, 100, 300)
 
@@ -171,7 +162,7 @@ class TestLaplacianSmoothing(unittest.TestCase):
 
     def test_laplacian_smoothing_cotcurv(self):
         """
-        Test Laplacian Smoothing with uniform weights.
+        Test Laplacian Smoothing with cotcurv weights.
         """
         meshes = TestLaplacianSmoothing.init_meshes(10, 100, 300)
 
@@ -191,9 +182,7 @@ class TestLaplacianSmoothing(unittest.TestCase):
         verts_list = []
         faces_list = []
         for _ in range(num_meshes):
-            verts = torch.rand(
-                (num_verts, 3), dtype=torch.float32, device=device
-            )
+            verts = torch.rand((num_verts, 3), dtype=torch.float32, device=device)
             faces = torch.randint(
                 num_verts, size=(num_faces, 3), dtype=torch.int64, device=device
             )

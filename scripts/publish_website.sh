@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
 
 usage() {
   echo "Usage: $0 [-b]"
@@ -27,7 +27,7 @@ yarn
 yarn run build
 
 cd .. || exit
-./scripts/build_website.sh -b
+bash ./scripts/build_website.sh -b
 
 cd "${WORK_DIR}" || exit
 rm -rf pytorch3d-gh-pages/*
